@@ -1,0 +1,391 @@
+import csv
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget, QLabel,
+                             QPushButton, QHBoxLayout, QMessageBox,
+                             QGroupBox, QSpinBox, QFormLayout, QTabWidget)
+from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtGui import QFont
+
+
+class PredictionWorker(QThread):
+    result_ready = pyqtSignal(object)
+
+    def __init__(self, predict_func, target_year):
+        super().__init__()
+        self.predict_func = predict_func
+        self.target_year = target_year
+
+    def run(self):
+        result = self.predict_func(self.target_year)
+        self.result_ready.emit(result)
+
+
+class TuberculosisPredictionApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Прогнозирование заболеваемости туберкулезом в Пермском крае")
+        self.setGeometry(100, 100, 1300, 800)
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #f5f5f5;
+            }
+            QGroupBox {
+                border: 1px solid #ccc;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 15px;
+                background-color: white;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 3px;
+            }
+            QPushButton {
+                background-color: #FF5722;
+                color: white;
+                border: none;
+                padding: 8px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #E64A19;
+            }
+            QSpinBox {
+                padding: 5px;
+            }
+            QLabel {
+                margin: 5px;
+            }
+        """)
+
+        self.data = None
+        self.years = None
+        self.X_target = None
+        self.x1 = None
+        self.x2 = None
+        self.x3 = None
+        self.coefficients = None
+        self.year_cutoff = 2024
+
+        self.load_data("4.csv")  # Файл с данными по туберкулезу
+        self.init_ui()
+
+        self.prediction_thread = None
+
+    def load_data(self, file_path):
+        data = []
+        with open(file_path, "r", encoding="cp1251") as f:
+            reader = csv.reader(f, delimiter=";")
+            for row in reader:
+                row = [item.strip() for item in row if item.strip()]
+                if not row or "год" in row[0].lower() or len(row) != 5:
+                    continue
+
+                try:
+                    year = int(float(row[0].replace(",", ".")))
+                    X_target = float(row[1].replace(",", "."))  # Заболеваемость туберкулезом
+                    x1 = float(row[2].replace(",", "."))  # Фактор 1 (уровень вакцинации)
+                    x2 = float(row[3].replace(",", "."))  # Фактор 2 (Охват флюорографическим обследованием)
+                    x3 = float(row[4].replace(",", "."))  # Фактор 3 (доходы населения)
+                    data.append([year, X_target, x1, x2, x3])
+                except ValueError as e:
+                    print(f"Пропуск строки {row}: {e}")
+                    continue
+
+        if not data:
+            raise ValueError("Нет данных для обработки!")
+
+        self.data = data
+        self.prepare_data()
+
+    def prepare_data(self):
+        self.years = np.array([int(row[0]) for row in self.data], dtype=np.int32)
+        self.X_target = np.array([float(row[1]) for row in self.data], dtype=np.float64)
+        self.x1 = np.array([float(row[2]) for row in self.data], dtype=np.float64)
+        self.x2 = np.array([float(row[3]) for row in self.data], dtype=np.float64)
+        self.x3 = np.array([float(row[4]) for row in self.data], dtype=np.float64)
+
+        mask = self.years <= self.year_cutoff
+        self.train_model(self.x1[mask], self.x2[mask], self.x3[mask], self.X_target[mask])
+
+    def train_model(self, x1, x2, x3, X_target):
+        A = np.column_stack([x1, x2, x3])
+        AT = A.T
+        ATA = AT @ A
+        ATy = AT @ X_target
+        self.coefficients = np.linalg.inv(ATA) @ ATy
+
+    def predict_future(self, target_year):
+        years = self.years[self.years <= self.year_cutoff]
+        x1 = self.x1[self.years <= self.year_cutoff]
+        x2 = self.x2[self.years <= self.year_cutoff]
+        x3 = self.x3[self.years <= self.year_cutoff]
+
+        predicted_x1 = []
+        predicted_x2 = []
+        predicted_x3 = []
+
+        for year in range(years[-1] + 1, target_year + 1):
+            delta_x1 = np.mean(np.diff(x1[-5:])) if len(x1) > 1 else 0
+            delta_x2 = np.mean(np.diff(x2[-5:])) if len(x2) > 1 else 0
+            delta_x3 = np.mean(np.diff(x3[-5:])) if len(x3) > 1 else 0
+
+            new_x1 = x1[-1] + delta_x1 * (year - years[-1])
+            new_x2 = max(0, x2[-1] + delta_x2 * (year - years[-1]))
+            new_x3 = x3[-1] + delta_x3 * (year - years[-1])
+
+            predicted_x1.append(new_x1)
+            predicted_x2.append(new_x2)
+            predicted_x3.append(new_x3)
+
+        all_years = np.concatenate([years, np.arange(years[-1] + 1, target_year + 1)])
+        all_x1 = np.concatenate([x1, predicted_x1])
+        all_x2 = np.concatenate([x2, predicted_x2])
+        all_x3 = np.concatenate([x3, predicted_x3])
+
+        a, b, c = self.coefficients
+        predictions = a * all_x1 + b * all_x2 + c * all_x3
+
+        return all_years, all_x1, all_x2, all_x3, predictions
+
+    def init_ui(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+
+        main_layout = QHBoxLayout()
+        central_widget.setLayout(main_layout)
+
+        # Левая панель с графиком
+        left_panel = QWidget()
+        left_layout = QVBoxLayout()
+        left_panel.setLayout(left_layout)
+
+        # Создаем график с тематическими цветами для туберкулеза
+        self.figure, self.ax = plt.subplots(figsize=(10, 7))
+        self.figure.set_facecolor('#f5f5f5')
+        self.ax.set_facecolor('#f5f5f5')
+        self.canvas = FigureCanvas(self.figure)
+        left_layout.addWidget(self.canvas)
+
+        # Правая панель с управлением и информацией
+        right_panel = QTabWidget()
+        right_panel.setMaximumWidth(400)
+
+        # Вкладка управления
+        control_tab = QWidget()
+        control_layout = QVBoxLayout()
+        control_tab.setLayout(control_layout)
+
+        control_group = QGroupBox("Параметры прогноза")
+        group_layout = QFormLayout()
+
+        self.year_spinbox = QSpinBox()
+        self.year_spinbox.setMinimum(self.year_cutoff + 1)
+        self.year_spinbox.setMaximum(2100)
+        self.year_spinbox.setValue(2025)
+        self.year_spinbox.setStyleSheet("background-color: white;")
+
+        predict_btn = QPushButton("Построить прогноз")
+        predict_btn.setStyleSheet("background-color: #FF5722;")
+        predict_btn.clicked.connect(self.update_plot)
+
+        info_btn = QPushButton("Справка")
+        info_btn.setStyleSheet("background-color: #607D8B;")
+        info_btn.clicked.connect(self.show_info)
+
+        group_layout.addRow(QLabel("Прогноз до года:"), self.year_spinbox)
+        group_layout.addRow(predict_btn)
+        group_layout.addRow(info_btn)
+        control_group.setLayout(group_layout)
+
+        # Группа с прогнозом
+        self.forecast_group = QGroupBox("Результаты прогноза")
+        forecast_layout = QVBoxLayout()
+        self.forecast_label = QLabel("Выберите год и нажмите 'Построить прогноз'")
+        self.forecast_label.setWordWrap(True)
+        self.forecast_label.setFont(QFont('Arial', 10))
+        forecast_layout.addWidget(self.forecast_label)
+        self.forecast_group.setLayout(forecast_layout)
+
+        control_layout.addWidget(control_group)
+        control_layout.addWidget(self.forecast_group)
+        control_layout.addStretch()
+
+        # Вкладка информации о модели
+        model_tab = QWidget()
+        model_layout = QVBoxLayout()
+        model_tab.setLayout(model_layout)
+
+        self.model_info_label = QLabel()
+        self.model_info_label.setWordWrap(True)
+        self.model_info_label.setFont(QFont('Arial', 10))
+        self.update_model_info()
+
+        model_group = QGroupBox("Математическая модель")
+        model_group_layout = QVBoxLayout()
+        model_group_layout.addWidget(self.model_info_label)
+        model_group.setLayout(model_group_layout)
+
+        model_layout.addWidget(model_group)
+        model_layout.addStretch()
+
+        right_panel.addTab(control_tab, "Управление")
+        right_panel.addTab(model_tab, "Модель")
+
+        main_layout.addWidget(left_panel)
+        main_layout.addWidget(right_panel)
+
+        self.plot_data()
+
+    def update_model_info(self):
+        if self.coefficients is None:
+            return
+
+        a, b, c = self.coefficients
+        factors = {
+            'Уровень вакцинации (x₁)': a,
+            'Охват флюорографическим обследованием (x₂)': b,
+            'Доходы населения (x₃)': c
+        }
+
+        most_influential = max(factors.items(), key=lambda x: abs(x[1]))
+        least_influential = min(factors.items(), key=lambda x: abs(x[1]))
+
+        text = f"""
+            <h3 style="color: #FF5722;">Уравнение модели:</h3>
+            <p style="font-size: 14px; background-color: #f0f0f0; padding: 10px; border-radius: 5px;">
+            ŷ = {a:.4f}·x₁ + {b:.4f}·x₂ + {c:.4f}·x₃</p>
+
+            <h3 style="color: #FF5722;">Анализ влияния факторов:</h3>
+            <p><b>Наибольшее влияние:</b> {most_influential[0]} (коэффициент {most_influential[1]:.4f})<br>
+            <b>Наименьшее влияние:</b> {least_influential[0]} (коэффициент {least_influential[1]:.4f})</p>
+
+            <h3 style="color: #FF5722;">Интерпретация:</h3>
+            <p>"""
+        if most_influential[0].startswith("Уровень вакцинации"):
+            text += "Уровень вакцинации БЦЖ оказывает наибольшее влияние на заболеваемость туберкулезом.<br>"
+        elif most_influential[0].startswith("Охват флюорографическим обследованием"):
+            text += "Охват флюорографическим обследованием существенно влияет на распространение туберкулеза.<br>"
+        else:
+            text += "Уровень доходов населения является ключевым фактором в заболеваемости туберкулезом.<br>"
+
+        text += "<br>Отрицательные коэффициенты указывают на обратную зависимость (например, рост вакцинации снижает заболеваемость).</p>"
+
+        self.model_info_label.setText(text)
+
+    def plot_data(self):
+        self.ax.clear()
+
+        # Фактические данные
+        mask = self.years <= self.year_cutoff
+        self.ax.plot(self.years[mask], self.X_target[mask],
+                     'o-', color='#FF5722', linewidth=2, markersize=8,
+                     label="Фактические данные")
+
+        self.ax.axvline(x=self.year_cutoff, color='#607D8B', linestyle='--',
+                        linewidth=1.5, label="Граница данных")
+
+        self.ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+        self.ax.set_xlabel("Год", fontsize=12)
+        self.ax.set_ylabel("Заболеваемость туберкулезом (на 100 тыс. человек)", fontsize=12)
+        self.ax.set_title("Прогноз заболеваемости туберкулезом", fontsize=14, pad=20)
+
+        # Улучшаем легенду
+        legend = self.ax.legend(facecolor='white', framealpha=0.9)
+        legend.get_frame().set_edgecolor('#cccccc')
+
+        self.ax.grid(True, linestyle='--', alpha=0.7)
+        self.canvas.draw()
+
+    def update_plot(self):
+        target_year = self.year_spinbox.value()
+
+        self.prediction_thread = PredictionWorker(self.predict_future, target_year)
+        self.prediction_thread.result_ready.connect(self.handle_prediction_result)
+        self.prediction_thread.start()
+
+    def handle_prediction_result(self, result):
+        all_years, all_x1, all_x2, all_x3, predictions = result
+
+        self.ax.clear()
+
+        # Фактические данные
+        mask = self.years <= self.year_cutoff
+        self.ax.plot(self.years[mask], self.X_target[mask],
+                     'o-', color='#FF5722', linewidth=2, markersize=8,
+                     label="Фактические данные")
+
+        # Прогноз
+        forecast_mask = (all_years > self.year_cutoff) & (predictions >= 0)
+        if any(forecast_mask):
+            self.ax.plot(all_years[forecast_mask], predictions[forecast_mask],
+                         'o-', color='#9C27B0', linewidth=2, markersize=8,
+                         label="Прогноз")
+
+        self.ax.axvline(x=self.year_cutoff, color='#607D8B', linestyle='--',
+                        linewidth=1.5, label="Граница данных")
+
+        self.ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+        self.ax.set_xlabel("Год", fontsize=12)
+        self.ax.set_ylabel("Заболеваемость туберкулезом (на 100 тыс. человек)", fontsize=12)
+        self.ax.set_title(f"Прогноз до {all_years[-1]} года", fontsize=14, pad=20)
+
+        legend = self.ax.legend(facecolor='white', framealpha=0.9)
+        legend.get_frame().set_edgecolor('#cccccc')
+
+        self.ax.grid(True, linestyle='--', alpha=0.7)
+        self.canvas.draw()
+
+        # Обновляем информацию о прогнозе
+        predicted_value = predictions[-1] if predictions[-1] >= 0 else predictions[forecast_mask][-1]
+        forecast_text = f"""
+            <h3 style="color: #FF5722;">Прогноз на {all_years[-1]} год</h3>
+            <p style="font-size: 14px; background-color: #f0f0f0; padding: 10px; border-radius: 5px;">
+            Заболеваемость туберкулезом: <b>{predicted_value:.1f}</b> на 100 тыс. человек</p>
+
+            <h4>Факторы прогноза:</h4>
+            <ul>
+                <li>Уровень вакцинации: {all_x1[-1]:.2f}%</li>
+                <li>Охват флюорографическим обследованием: {all_x2[-1]:.2f}</li>
+                <li>Средний доход: {all_x3[-1]:.2f} тыс. руб.</li>
+            </ul>
+            """
+        self.forecast_label.setText(forecast_text)
+
+    def show_info(self):
+        info_text = """
+            <h3 style="color: #FF5722;">Справка по программе</h3>
+            <p>Эта программа прогнозирует уровень заболеваемости туберкулезом в Пермском крае на основе трех факторов:</p>
+            <ol>
+                <li><b>Уровень вакцинации БЦЖ</b> - процент населения, получившего вакцинацию</li>
+                <li><b>Флюорография</b> - охват флюорографическим обследованием</li>
+                <li><b>Доходы населения</b> - средний доход на душу населения</li>
+            </ol>
+            <p>Программа использует метод наименьших квадратов для построения линейной регрессионной модели.</p>
+
+            <h4 style="color: #FF5722;">Как использовать:</h4>
+            <ol>
+                <li>Выберите год для прогноза</li>
+                <li>Нажмите кнопку "Построить прогноз"</li>
+                <li>Изучите результаты на графике и во вкладках</li>
+            </ol>
+
+            <h4 style="color: #FF5722;">Интерпретация результатов:</h4>
+            <p>Рост уровня вакцинации и охват флюорографическим обследованием обычно приводят к снижению заболеваемости, 
+            что отражается отрицательными коэффициентами в модели.</p>
+            """
+        msg = QMessageBox()
+        msg.setWindowTitle("Справка")
+        msg.setText(info_text)
+        msg.setStyleSheet("QLabel{min-width: 600px;}")
+        msg.exec_()
+
+
+if __name__ == '__main__':
+    app = QApplication([])
+    window = TuberculosisPredictionApp()
+    window.show()
+    app.exec_()
